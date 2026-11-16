@@ -20,16 +20,19 @@ jobs:
       contents: read
     env:
       AZURE_FUNCTIONAPP_NAME: 'funcapp-taprx-murilo'
+      AZURE_CLIENT_ID: '1552f985-d40a-4211-bbcc-8065373a7a17'
+      AZURE_TENANT_ID: '57fe0ac9-f7f7-4580-8b30-5aa7f0ac8e3b'
+      AZURE_SUBSCRIPTION_ID: 'b206d9a8-fd69-4b60-8d21-f9b5f43405d7'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.14'
+          python-version: '3.13'
       - uses: azure/login@v2
         with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
       - uses: Azure/functions-action@v1
         with:
           app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
