@@ -24,6 +24,17 @@ TABELAS_ORDEM = [
     "csat_avaliacao",
 ]
 
+# Chaves únicas de negócio para evitar duplicidade (erro 2627) em reexecuções diárias
+CHAVES_UNICAS_TABELA = {
+    "categoria": ["cd_categoria"],
+    "cliente_organizacao": ["cd_cliente_organizacao"],
+    "fila": ["cd_fila"],
+    "sla": ["cd_sla"],
+    "analista": ["cd_analista"],
+    "solicitante": ["cd_solicitante"],
+    "chamado": ["nr_chamado"],
+}
+
 
 def conectar_sql() -> pyodbc.Connection:
     servidor = os.environ["SQL_HOST"]
@@ -52,6 +63,11 @@ def _limpar_valor(val):
             return None
     except (TypeError, ValueError):
         pass
+    if isinstance(val, str):
+        val_limpo = val.strip()
+        if val_limpo == "" or val_limpo.lower() in {"nan", "none", "null", "nat"}:
+            return None
+        return val_limpo
     if isinstance(val, float) and val.is_integer():
         return int(val)
     if hasattr(val, "to_pydatetime"):
@@ -107,72 +123,55 @@ def popular_tabela(cursor: pyodbc.Cursor, tabela: str, df: pd.DataFrame) -> int:
         logging.warning(f"[{tabela}] Nenhuma coluna em comum entre o CSV e dbo.{tabela}.")
         return 0
 
-    tem_identity_no_csv = any(col in colunas_identity for col in colunas_validas)
-    if tem_identity_no_csv:
-        cursor.execute(f"SET IDENTITY_INSERT dbo.[{tabela}] ON")
+    registros = [
+        tuple(_limpar_valor(v) for v in row)
+        for row in df[colunas_validas].itertuples(index=False, name=None)
+    ]
 
-    try:
-        colunas_sql = ", ".join(f"[{col}]" for col in colunas_validas)
-        placeholders = ", ".join("?" for _ in colunas_validas)
-        query = f"INSERT INTO dbo.[{tabela}] ({colunas_sql}) VALUES ({placeholders})"
+    chaves = [c for c in CHAVES_UNICAS_TABELA.get(tabela, []) if c in colunas_validas]
+    cursor.fast_executemany = False
 
-        registros = [
-            tuple(_limpar_valor(v) for v in row)
-            for row in df[colunas_validas].itertuples(index=False, name=None)
-        ]
-        cursor.fast_executemany = False
-        cursor.executemany(query, registros)
-        return len(registros)
-    finally:
+    if not chaves:
+        tem_identity_no_csv = any(col in colunas_identity for col in colunas_validas)
         if tem_identity_no_csv:
-            try:
-                cursor.execute(f"SET IDENTITY_INSERT dbo.[{tabela}] OFF")
-            except Exception:
-                pass
+            cursor.execute(f"SET IDENTITY_INSERT dbo.[{tabela}] ON")
+        try:
+            colunas_sql = ", ".join(f"[{col}]" for col in colunas_validas)
+            placeholders = ", ".join("?" for _ in colunas_validas)
+            query = f"INSERT INTO dbo.[{tabela}] ({colunas_sql}) VALUES ({placeholders})"
+            cursor.executemany(query, registros)
+            return len(registros)
+        finally:
+            if tem_identity_no_csv:
+                try:
+                    cursor.execute(f"SET IDENTITY_INSERT dbo.[{tabela}] OFF")
+                except Exception:
+                    pass
 
+    colunas_update = [
+        c for c in colunas_validas if c not in chaves and c not in colunas_identity
+    ]
+    origem_cols_sql = ", ".join(f"? AS [{c}]" for c in colunas_validas)
+    condicao_on = " AND ".join(f"alvo.[{c}] = origem.[{c}]" for c in chaves)
 
-def popular_tabela(cursor: pyodbc.Cursor, tabela: str, df: pd.DataFrame) -> int:
-    if df.empty:
-        logging.info(f"[{tabela}] Sem registros para inserir.")
-        return 0
+    set_update_sql = ", ".join(f"alvo.[{c}] = origem.[{c}]" for c in colunas_update)
+    insert_cols = [c for c in colunas_validas if c not in colunas_identity]
+    insert_cols_sql = ", ".join(f"[{c}]" for c in insert_cols)
+    insert_vals_sql = ", ".join(f"origem.[{c}]" for c in insert_cols)
 
-    cursor.execute(
-        """
-        SELECT c.name, c.is_identity
-        FROM sys.columns c
-        INNER JOIN sys.tables t ON c.object_id = t.object_id
-        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-        WHERE s.name = 'dbo'
-          AND t.name = ?
-        ORDER BY c.column_id
-        """,
-        tabela,
+    merge_sql = f"""
+    MERGE dbo.[{tabela}] AS alvo
+    USING (SELECT {origem_cols_sql}) AS origem
+        ON ({condicao_on})
+    """
+    if set_update_sql:
+        merge_sql += f"\nWHEN MATCHED THEN UPDATE SET {set_update_sql}"
+    merge_sql += (
+        f"\nWHEN NOT MATCHED THEN INSERT ({insert_cols_sql}) VALUES ({insert_vals_sql});"
     )
-    colunas_info = cursor.fetchall()
-    colunas_destino = [row[0] for row in colunas_info]
-    colunas_identity = {row[0] for row in colunas_info if row[1] == 1}
 
-    colunas_validas = [col for col in colunas_destino if col in df.columns]
-    if not colunas_validas:
-        logging.warning(f"[{tabela}] Nenhuma coluna em comum entre o CSV e dbo.{tabela}.")
-        return 0
-
-    tem_identity_no_csv = any(col in colunas_identity for col in colunas_validas)
-    if tem_identity_no_csv:
-        cursor.execute(f"SET IDENTITY_INSERT dbo.[{tabela}] ON")
-
-    try:
-        colunas_sql = ", ".join(f"[{col}]" for col in colunas_validas)
-        placeholders = ", ".join("?" for _ in colunas_validas)
-        query = f"INSERT INTO dbo.[{tabela}] ({colunas_sql}) VALUES ({placeholders})"
-
-        registros = [tuple(x) for x in df[colunas_validas].itertuples(index=False, name=None)]
-        cursor.fast_executemany = True
-        cursor.executemany(query, registros)
-        return len(registros)
-    finally:
-        if tem_identity_no_csv:
-            cursor.execute(f"SET IDENTITY_INSERT dbo.[{tabela}] OFF")
+    cursor.executemany(merge_sql, registros)
+    return len(registros)
 
 
 @app.timer_trigger(
@@ -203,11 +202,14 @@ def carregar_tabelas_dbo(myTimer: func.TimerRequest) -> None:
             df = ler_csv_datalake(blob_service, container, blob_name)
             inseridos = popular_tabela(cursor, tabela, df)
             conn_sql.commit()
-            logging.info(f"[{tabela}] {inseridos} registros inseridos.")
+            logging.info(f"[{tabela}] {inseridos} registros processados.")
 
         logging.info("Carga diária finalizada com sucesso!")
     except Exception as erro:
-        conn_sql.rollback()
+        try:
+            conn_sql.rollback()
+        except Exception:
+            pass
         logging.error(f"Falha na carga diária: {erro}")
         raise
     finally:
