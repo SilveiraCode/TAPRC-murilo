@@ -44,6 +44,23 @@ def conectar_sql() -> pyodbc.Connection:
     return pyodbc.connect(conn_str)
 
 
+def _limpar_valor(val):
+    if val is None:
+        return None
+    try:
+        if pd.isna(val):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(val, float) and val.is_integer():
+        return int(val)
+    if hasattr(val, "to_pydatetime"):
+        return val.to_pydatetime()
+    if hasattr(val, "item"):
+        return _limpar_valor(val.item())
+    return val
+
+
 def ler_csv_datalake(
     blob_service: BlobServiceClient, container: str, blob_name: str
 ) -> pd.DataFrame:
@@ -59,12 +76,59 @@ def ler_csv_datalake(
         return pd.DataFrame()
 
     sep = ";" if linhas[0].count(";") > linhas[0].count(",") else ","
-    df = pd.read_csv(io.StringIO(texto), sep=sep)
+    df = pd.read_csv(io.StringIO(texto), sep=sep, dtype=object)
     df = df.where(pd.notnull(df), None)
-
-    for col in df.columns:
-        df[col] = df[col].apply(lambda v: None if pd.isna(v) else v)
     return df
+
+
+def popular_tabela(cursor: pyodbc.Cursor, tabela: str, df: pd.DataFrame) -> int:
+    if df.empty:
+        logging.info(f"[{tabela}] Sem registros para inserir.")
+        return 0
+
+    cursor.execute(
+        """
+        SELECT c.name, c.is_identity
+        FROM sys.columns c
+        INNER JOIN sys.tables t ON c.object_id = t.object_id
+        INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+        WHERE s.name = 'dbo'
+          AND t.name = ?
+        ORDER BY c.column_id
+        """,
+        tabela,
+    )
+    colunas_info = cursor.fetchall()
+    colunas_destino = [row[0] for row in colunas_info]
+    colunas_identity = {row[0] for row in colunas_info if row[1] == 1}
+
+    colunas_validas = [col for col in colunas_destino if col in df.columns]
+    if not colunas_validas:
+        logging.warning(f"[{tabela}] Nenhuma coluna em comum entre o CSV e dbo.{tabela}.")
+        return 0
+
+    tem_identity_no_csv = any(col in colunas_identity for col in colunas_validas)
+    if tem_identity_no_csv:
+        cursor.execute(f"SET IDENTITY_INSERT dbo.[{tabela}] ON")
+
+    try:
+        colunas_sql = ", ".join(f"[{col}]" for col in colunas_validas)
+        placeholders = ", ".join("?" for _ in colunas_validas)
+        query = f"INSERT INTO dbo.[{tabela}] ({colunas_sql}) VALUES ({placeholders})"
+
+        registros = [
+            tuple(_limpar_valor(v) for v in row)
+            for row in df[colunas_validas].itertuples(index=False, name=None)
+        ]
+        cursor.fast_executemany = False
+        cursor.executemany(query, registros)
+        return len(registros)
+    finally:
+        if tem_identity_no_csv:
+            try:
+                cursor.execute(f"SET IDENTITY_INSERT dbo.[{tabela}] OFF")
+            except Exception:
+                pass
 
 
 def popular_tabela(cursor: pyodbc.Cursor, tabela: str, df: pd.DataFrame) -> int:
