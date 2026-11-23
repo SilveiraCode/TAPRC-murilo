@@ -28,6 +28,7 @@ TABELAS_ORDEM = [
 CHAVES_UNICAS_TABELA = {
     "categoria": ["cd_categoria"],
     "cliente_organizacao": ["cd_cliente_organizacao"],
+    "csat": ["Id"],
     "fila": ["cd_fila"],
     "sla": ["cd_sla"],
     "analista": ["cd_analista"],
@@ -118,17 +119,29 @@ def popular_tabela(cursor: pyodbc.Cursor, tabela: str, df: pd.DataFrame) -> int:
     colunas_destino = [row[0] for row in colunas_info]
     colunas_identity = {row[0] for row in colunas_info if row[1] == 1}
 
-    colunas_validas = [col for col in colunas_destino if col in df.columns]
+    mapa_df_cols = {str(col).strip().lower(): col for col in df.columns}
+    colunas_validas = [
+        col for col in colunas_destino if col.strip().lower() in mapa_df_cols
+    ]
     if not colunas_validas:
         logging.warning(f"[{tabela}] Nenhuma coluna em comum entre o CSV e dbo.{tabela}.")
         return 0
 
+    df_ordenado = pd.DataFrame(
+        {col: df[mapa_df_cols[col.strip().lower()]] for col in colunas_validas}
+    )
+
     registros = [
         tuple(_limpar_valor(v) for v in row)
-        for row in df[colunas_validas].itertuples(index=False, name=None)
+        for row in df_ordenado.itertuples(index=False, name=None)
     ]
 
-    chaves = [c for c in CHAVES_UNICAS_TABELA.get(tabela, []) if c in colunas_validas]
+    mapa_cols_validas = {col.strip().lower(): col for col in colunas_validas}
+    chaves = [
+        mapa_cols_validas[c.strip().lower()]
+        for c in CHAVES_UNICAS_TABELA.get(tabela, [])
+        if c.strip().lower() in mapa_cols_validas
+    ]
     cursor.fast_executemany = False
 
     if not chaves:
